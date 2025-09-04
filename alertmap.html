@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Disaster Explorer</title>
+
+  <!-- CesiumJS -->
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.113/Build/Cesium/Cesium.js"></script>
+  <link href="https://cesium.com/downloads/cesiumjs/releases/1.113/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+
+  <!-- jsPDF -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+  <style>
+    html, body, #cesiumContainer {
+      width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden;
+      font-family: Arial, sans-serif;
+    }
+
+    #layerControl {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.7);
+      color: white;
+      padding: 15px 20px;
+      border-radius: 12px;
+      font-size: 14px;
+      z-index: 999;
+      user-select: none;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      width: 180px;  /* enough width for button */
+    }
+
+    .toggle-container {
+      display: flex;
+      align-items: center;
+      cursor: pointer;
+    }
+    .toggle-container span { margin-left: 10px; user-select: none; }
+
+    .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #ccc; transition: 0.4s; border-radius: 20px;
+    }
+    .slider:before {
+      position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px;
+      background-color: white; transition: 0.4s; border-radius: 50%;
+    }
+    input:checked + .slider { background-color: #28a745; }
+    input:checked + .slider:before { transform: translateX(20px); }
+
+    #downloadBtn {
+      background: #28a745;
+      color: white;
+      border: none;
+      padding: 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      width: 100%;
+      box-shadow: 0 3px 6px rgba(0,0,0,0.3);
+      transition: background 0.3s;
+    }
+    #downloadBtn:hover { background: #218838; }
+
+    /* Side info panel for clicked entity */
+    #infoPanel {
+      position: absolute; top: 200px; right: 10px; width: 280px; max-height: 40%;
+      overflow-y: auto; background: rgba(0,0,0,0.75); color: #fff;
+      padding: 12px 14px; border-radius: 10px; font-size: 13px; z-index: 999; display: none;
+      box-shadow: 0 3px 6px rgba(0,0,0,0.3);
+    }
+    #infoPanel h3 { margin: 0 0 8px; font-size: 15px; }
+    #infoPanel .meta { font-size: 12px; opacity: 0.9; }
+    #infoPanel .hint { margin-top: 8px; font-size: 12px; opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+
+  <div id="layerControl">
+    <label class="toggle-container">
+      <div class="switch"><input type="checkbox" id="firesLayer"><span class="slider"></span></div>
+      <span>🔴 Fires</span>
+    </label>
+    <label class="toggle-container">
+      <div class="switch"><input type="checkbox" id="weatherLayer" checked><span class="slider"></span></div>
+      <span>🔵 Floods</span>
+    </label>
+    <label class="toggle-container">
+      <div class="switch"><input type="checkbox" id="meteoritesLayer"><span class="slider"></span></div>
+      <span>🟡 Meteorites</span>
+    </label>
+
+    <!-- ✅ Download button moved inside -->
+    <button id="downloadBtn">📥 Download Report</button>
+  </div>
+
+  <div id="infoPanel"></div>
+
+  <script>
+    const { jsPDF } = window.jspdf;
+
+      // 🔑 Set your Ion token
+    Cesium.Ion.defaultAccessToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3NmNiMWJlMS0wNWE1LTQyNmItODlkYy1mZmY3YjlmZGRiNWIiLCJpZCI6MzM2NTYyLCJpYXQiOjE3NTY0NzQ0NTh9.d6qsTXzfLXfZSUOzpnJgWMfr1YzSuoNmt6EeRVtCLb4";
+
+    // -----------------
+    // CESIUM VIEWER
+    // -----------------
+    const viewer = new Cesium.Viewer("cesiumContainer", {
+      terrainProvider: Cesium.Terrain.fromWorldTerrain(),
+      baseLayerPicker: true,
+      timeline: false,
+      animation: false,
+      infoBox: false,
+      selectionIndicator: false
+    });
+
+    let firesLayer, weatherLayer, meteoritesLayer;
+    let selectedEntity = null;
+    let highlightBillboard = null;
+
+    // -----------------
+    // CUSTOM POINTERS
+    // -----------------
+    function tagEntities(ds, tag) {
+      ds.entities.values.forEach(e => {
+        e.point = undefined;
+        let iconUrl;
+        if (tag === "fires") {
+          iconUrl = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png";
+        } else if (tag === "floods") {
+          iconUrl = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-blue.png";
+        } else if (tag === "meteorites") {
+          iconUrl = "https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-yellow.png";
+        }
+
+        e.billboard = new Cesium.BillboardGraphics({
+          image: iconUrl,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+          scale: 0.5
+        });
+      });
+    }
+
+    // -----------------
+    // LOAD DATASETS
+    // -----------------
+    Cesium.GeoJsonDataSource.load("data/weather.geojson",{clampToGround:true}).then(ds=>{
+      weatherLayer=ds; tagEntities(ds,"floods"); viewer.dataSources.add(ds);
+    });
+    Cesium.GeoJsonDataSource.load("data/meteorites_clean.geojson",{clampToGround:true}).then(ds=>{
+      meteoritesLayer=ds; tagEntities(ds,"meteorites");
+    });
+    Cesium.GeoJsonDataSource.load("data/fires_small.geojson",{clampToGround:true}).then(ds=>{
+      firesLayer=ds; tagEntities(ds,"fires");
+    });
+
+    // -----------------
+    // LAYER TOGGLES
+    // -----------------
+    function layerHasEntity(layer, entity) {
+      if (!layer || !entity) return false;
+      return layer.entities.values.indexOf(entity) !== -1;
+    }
+
+    function clearSelectionIfRemoved(layer, checked) {
+      if (!checked && selectedEntity && layerHasEntity(layer, selectedEntity)) {
+        selectedEntity = null;
+        viewer.selectedEntity = undefined;
+        hidePanel();
+        if (highlightBillboard) {
+          viewer.entities.remove(highlightBillboard);
+          highlightBillboard = null;
+        }
+      }
+    }
+
+    function safeToggle(layer, checked){
+      if(!layer) return;
+      if (checked) {
+        viewer.dataSources.add(layer);
+      } else {
+        viewer.dataSources.remove(layer);
+      }
+      clearSelectionIfRemoved(layer, checked);
+    }
+
+    document.getElementById("firesLayer").addEventListener("change",e=>safeToggle(firesLayer,e.target.checked));
+    document.getElementById("weatherLayer").addEventListener("change",e=>safeToggle(weatherLayer,e.target.checked));
+    document.getElementById("meteoritesLayer").addEventListener("change",e=>safeToggle(meteoritesLayer,e.target.checked));
+
+    // -----------------
+    // PICK/SELECT + HIGHLIGHT
+    // -----------------
+    viewer.selectedEntityChanged.addEventListener((entity) => {
+      if (highlightBillboard) {
+        viewer.entities.remove(highlightBillboard);
+        highlightBillboard = null;
+      }
+
+      if (entity) {
+        selectedEntity = entity;
+        showEntityDetails(entity);
+
+        const position = entity.position ? entity.position.getValue(viewer.clock.currentTime) : null;
+        if (position) {
+          highlightBillboard = viewer.entities.add({
+            position: position,
+            point: {
+              pixelSize: 18,
+              color: Cesium.Color.WHITE.withAlpha(0.9),
+              outlineColor: Cesium.Color.BLACK,
+              outlineWidth: 2,
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
+            }
+          });
+        }
+      } else {
+        selectedEntity = null;
+        hidePanel();
+      }
+    });
+
+    const clickHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+    clickHandler.setInputAction((movement) => {
+      const picked = viewer.scene.pick(movement.position);
+      let entity = undefined;
+      if (Cesium.defined(picked)) {
+        entity = picked.id || (picked.primitive && picked.primitive.id);
+      }
+      viewer.selectedEntity = entity;
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+    window.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") {
+        viewer.selectedEntity = undefined;
+      }
+    });
+
+    clickHandler.setInputAction((movement) => {
+      const picked = viewer.scene.pick(movement.position);
+      if (!Cesium.defined(picked)) viewer.selectedEntity = undefined;
+    }, Cesium.ScreenSpaceEventType.RIGHT_CLICK);
+
+    // -----------------
+    // HELPERS
+    // -----------------
+    function hidePanel() {
+      const panel = document.getElementById("infoPanel");
+      panel.style.display = "none";
+      panel.innerHTML = "";
+    }
+
+    function getEntityLatLon(e) {
+      const time = viewer.clock.currentTime;
+      if (e.position && e.position.getValue) {
+        const carto = Cesium.Cartographic.fromCartesian(e.position.getValue(time));
+        return {
+          lat: (carto && Cesium.Math.toDegrees(carto.latitude).toFixed(4)) || "N/A",
+          lon: (carto && Cesium.Math.toDegrees(carto.longitude).toFixed(4)) || "N/A"
+        };
+      }
+      return { lat: "N/A", lon: "N/A" };
+    }
+
+    function showEntityDetails(e) {
+      const { lat, lon } = getEntityLatLon(e);
+      const panel = document.getElementById("infoPanel");
+
+      let html = "";
+      if (e.properties?.acq_date) {
+        html = `<h3>🔥 Fire</h3>
+          <div class="meta">Date: ${e.properties.acq_date.getValue()}</div>
+          <div>Brightness: ${e.properties?.brightness?.getValue() || "N/A"}</div>
+          <div>Confidence: ${e.properties?.confidence?.getValue() || "N/A"}</div>
+          <div>Lat: ${lat}, Lon: ${lon}</div>`;
+      } else if (e.properties?.location) {
+        html = `<h3>🌊 Flood</h3>
+          <div class="meta">Location: ${e.properties.location.getValue()}</div>
+          <div>Date: ${e.properties?.date?.getValue() || "Unknown Date"}</div>
+          <div>Lat: ${lat}, Lon: ${lon}</div>`;
+      } else if (e.properties?.year || e.properties?.mass) {
+        html = `<h3>☄️ Meteorite</h3>
+          <div class="meta">Name: ${e.name || "Meteorite"}</div>
+          <div>Year: ${e.properties?.year?.getValue() || "Unknown"}</div>
+          <div>Mass: ${e.properties?.mass?.getValue() || "N/A"} g</div>
+          <div>Lat: ${lat}, Lon: ${lon}</div>`;
+      } else {
+        html = `<h3>ℹ️ Details</h3>
+          <div>Lat: ${lat}, Lon: ${lon}</div>`;
+      }
+
+      panel.innerHTML = html;
+      panel.style.display = "block";
+    }
+
+    // -----------------
+    // DOWNLOAD REPORT
+    // -----------------
+    document.getElementById("downloadBtn").addEventListener("click", () => {
+      const doc = new jsPDF();
+      let y = 20;
+
+      doc.setFont("times", "bold");
+      doc.setFontSize(18);
+      doc.text("Disaster Explorer Report", 14, y);
+      y += 12;
+
+      doc.setFont("times", "italic");
+      doc.setFontSize(11);
+      doc.text(`Generated on: ${new Date().toLocaleString()}`, 14, y);
+      y += 12;
+
+      function addEntityToPdf(e) {
+        const { lat, lon } = getEntityLatLon(e);
+        let title = "", details = [];
+
+        if (e.properties?.acq_date) {
+          title = "🔥 Fire";
+          details.push(`Date: ${e.properties.acq_date.getValue()}`);
+          details.push(`Brightness: ${e.properties?.brightness?.getValue() || "N/A"}`);
+          details.push(`Confidence: ${e.properties?.confidence?.getValue() || "N/A"}`);
+        } else if (e.properties?.location) {
+          title = "🌊 Flood";
+          details.push(`Location: ${e.properties.location.getValue()}`);
+          details.push(`Date: ${e.properties?.date?.getValue() || "Unknown"}`);
+        } else if (e.properties?.year || e.properties?.mass) {
+          title = "☄️ Meteorite";
+          details.push(`Name: ${e.name || "Unknown"}`);
+          details.push(`Year: ${e.properties?.year?.getValue() || "Unknown"}`);
+          details.push(`Mass: ${e.properties?.mass?.getValue() || "N/A"} g`);
+        } else {
+          title = "ℹ️ Data Point";
+        }
+
+        details.push(`Lat: ${lat}, Lon: ${lon}`);
+
+        doc.setFont("times", "bold");
+        doc.setFontSize(13);
+        doc.text(title, 14, y);
+        y += 7;
+
+        doc.setFont("times", "normal");
+        doc.setFontSize(11);
+        details.forEach(d => {
+          doc.text(`- ${d}`, 20, y);
+          y += 6;
+        });
+
+        y += 4;
+        if (y > 275) {
+          doc.addPage();
+          y = 20;
+        }
+      }
+
+      function addLayer(layer) {
+        if (!layer) return;
+        layer.entities.values.forEach(addEntityToPdf);
+      }
+
+      if (selectedEntity) {
+        addEntityToPdf(selectedEntity);
+      } else {
+        if (document.getElementById("firesLayer").checked) addLayer(firesLayer);
+        if (document.getElementById("weatherLayer").checked) addLayer(weatherLayer);
+        if (document.getElementById("meteoritesLayer").checked) addLayer(meteoritesLayer);
+      }
+
+      doc.save(selectedEntity ? "Selected_Point_Report.pdf" : "Disaster_Report.pdf");
+    });
+  </script>
+</body>
+</html>
