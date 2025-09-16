@@ -51,7 +51,7 @@ http://localhost:8000
 # 🌍 Deployment
 
 This project is live on GitHub Pages:
-👉 https://saiminghanaa.github.io/Alert-Map/
+👉 https://saiimeghanaaa.github.io/Alert-Map/
 
 
 # 📌 Future Scope
